@@ -1,0 +1,29 @@
+name: Bootstrap v1.0.0
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate release
+        run: |
+          set -euo pipefail
+          bash -n vmutex install.sh tests/test.sh
+          bash tests/test.sh
+          shellcheck vmutex install.sh tests/test.sh
+          script_version=$(sed -n 's/^readonly VMUTEX_VERSION="\([0-9][0-9.]*\)"$/\1/p' vmutex)
+          test "$script_version" = "1.0.0"
+      - name: Publish v1.0.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod 0755 vmutex install.sh
+          sha256sum vmutex > vmutex.sha256
+          gh release create v1.0.0 vmutex vmutex.sha256 install.sh --target "$GITHUB_SHA" --title "VMUTEX v1.0.0" --generate-notes
