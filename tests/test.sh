@@ -17,7 +17,8 @@ assert_eq() {
 bash -n "$ROOT_DIR/vmutex"
 bash -n "$ROOT_DIR/install.sh"
 
-# shellcheck source=../vmutex
+# The path is computed so the test also works outside a Git checkout.
+# shellcheck disable=SC1091
 source "$ROOT_DIR/vmutex"
 
 assert_eq "1.0.0" "$VMUTEX_VERSION" "script version"
@@ -38,11 +39,18 @@ assert_eq "EchoLunar/vmutex" "$(repository_name)" "repository binding"
 
 TEST_TMP=$(mktemp -d)
 trap 'rm -rf "$TEST_TMP"' EXIT
+# These variables are consumed by functions imported from vmutex above.
+# shellcheck disable=SC2034
 CONFIG_DIR="$TEST_TMP/etc-vmutex"
+# shellcheck disable=SC2034
 CONFIG_FILE="$CONFIG_DIR/config"
+# shellcheck disable=SC2034
 REPOSITORY_FILE="$CONFIG_DIR/repository"
+# shellcheck disable=SC2034
 INSTALL_PATH="$TEST_TMP/bin/vmutex"
+# shellcheck disable=SC2034
 BACKUP_DIR="$TEST_TMP/backups"
+# shellcheck disable=SC2034
 VMUTEX_TEST_MODE=1
 mkdir -p "$(dirname "$INSTALL_PATH")" "$CONFIG_DIR"
 cp "$ROOT_DIR/vmutex" "$INSTALL_PATH"
