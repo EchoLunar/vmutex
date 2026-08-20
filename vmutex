@@ -1,0 +1,909 @@
+#!/usr/bin/env bash
+
+set -o pipefail
+
+readonly VMUTEX_VERSION="1.0.0"
+readonly VMUTEX_REPOSITORY_DEFAULT="EchoLunar/vmutex"
+
+CONFIG_DIR="${VMUTEX_CONFIG_DIR:-/etc/vmutex}"
+CONFIG_FILE="${VMUTEX_CONFIG_FILE:-${CONFIG_DIR}/config}"
+REPOSITORY_FILE="${VMUTEX_REPOSITORY_FILE:-${CONFIG_DIR}/repository}"
+CERTBOT_ROOT="${VMUTEX_CERTBOT_ROOT:-/var/www/certbot}"
+INSTALL_PATH="${VMUTEX_INSTALL_PATH:-/usr/local/bin/vmutex}"
+BACKUP_DIR="${VMUTEX_BACKUP_DIR:-/usr/local/lib/vmutex/backups}"
+
+DOMAIN_SUFFIX=""
+CF_API_TOKEN=""
+CF_ZONE_ID=""
+ORIGIN_IPV4=""
+ORIGIN_IPV6=""
+
+require_root() {
+    if [ "${VMUTEX_TEST_MODE:-0}" != "1" ] && [ "$EUID" -ne 0 ]; then
+        echo "请使用：sudo vmutex"
+        exit 1
+    fi
+}
+
+prepare_config_dir() {
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+}
+
+load_config() {
+    DOMAIN_SUFFIX=""
+    CF_API_TOKEN=""
+    CF_ZONE_ID=""
+    ORIGIN_IPV4=""
+    ORIGIN_IPV6=""
+
+    if [ -f "$CONFIG_FILE" ]; then
+        # The file is root-owned and mode 0600. It intentionally uses shell quoting.
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE"
+    fi
+}
+
+save_config() {
+    prepare_config_dir
+    umask 077
+
+    {
+        printf 'DOMAIN_SUFFIX=%q\n' "$DOMAIN_SUFFIX"
+        printf 'CF_API_TOKEN=%q\n' "$CF_API_TOKEN"
+        printf 'CF_ZONE_ID=%q\n' "$CF_ZONE_ID"
+        printf 'ORIGIN_IPV4=%q\n' "$ORIGIN_IPV4"
+        printf 'ORIGIN_IPV6=%q\n' "$ORIGIN_IPV6"
+    } > "$CONFIG_FILE"
+
+    chmod 600 "$CONFIG_FILE"
+}
+
+valid_domain_suffix() {
+    local value="$1"
+    [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && [[ "$value" == *.* ]]
+}
+
+ensure_domain_config() {
+    load_config
+    if valid_domain_suffix "$DOMAIN_SUFFIX"; then
+        return 0
+    fi
+
+    echo "首次运行需要设置主域名，例如 example.com。"
+    while true; do
+        read -rp "主域名: " DOMAIN_SUFFIX
+        DOMAIN_SUFFIX="${DOMAIN_SUFFIX,,}"
+        if valid_domain_suffix "$DOMAIN_SUFFIX"; then
+            save_config
+            echo "✅ 已保存域名：$DOMAIN_SUFFIX"
+            return 0
+        fi
+        echo "❌ 域名格式不正确"
+    done
+}
+
+pause() {
+    echo
+    read -rp "按回车继续..."
+}
+
+cf_find_zone() {
+    local response
+
+    response=$(curl -fsS -G \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data-urlencode "name=$DOMAIN_SUFFIX" \
+        "https://api.cloudflare.com/client/v4/zones") || return 1
+
+    CF_ZONE_ID=$(printf '%s' "$response" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    if data.get("success") and data.get("result"):
+        print(data["result"][0]["id"])
+except (ValueError, KeyError, TypeError):
+    pass
+')
+
+    [ -n "$CF_ZONE_ID" ]
+}
+
+cf_setup() {
+    local current_domain token origin_ipv4 origin_ipv6
+
+    load_config
+    current_domain="$DOMAIN_SUFFIX"
+
+    echo "========== Cloudflare 设置 =========="
+    echo
+    read -rp "主域名 [${current_domain:-未设置}]: " DOMAIN_SUFFIX
+    DOMAIN_SUFFIX="${DOMAIN_SUFFIX:-$current_domain}"
+    DOMAIN_SUFFIX="${DOMAIN_SUFFIX,,}"
+
+    if ! valid_domain_suffix "$DOMAIN_SUFFIX"; then
+        echo "❌ 域名格式不正确"
+        return 1
+    fi
+
+    read -rsp "Cloudflare API Token（留空则保留现有值）: " token
+    echo
+    if [ -n "$token" ]; then
+        CF_API_TOKEN="$token"
+        CF_ZONE_ID=""
+    fi
+
+    read -rp "源站 IPv4 [${ORIGIN_IPV4:-未设置}]: " origin_ipv4
+    read -rp "源站 IPv6 [${ORIGIN_IPV6:-未设置}]: " origin_ipv6
+    ORIGIN_IPV4="${origin_ipv4:-$ORIGIN_IPV4}"
+    ORIGIN_IPV6="${origin_ipv6:-$ORIGIN_IPV6}"
+
+    if [ -n "$CF_API_TOKEN" ] && [ -z "$CF_ZONE_ID" ]; then
+        echo "正在查找 Cloudflare Zone ID..."
+        if ! cf_find_zone; then
+            echo "❌ 无法找到 Zone，请检查域名和 Token 权限"
+            return 1
+        fi
+    fi
+
+    save_config
+    echo "✅ Cloudflare 设置已保存"
+}
+
+cf_test() {
+    local response
+
+    load_config
+    if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then
+        echo "❌ Cloudflare 尚未完整配置"
+        return 1
+    fi
+
+    echo "正在测试 Cloudflare DNS API..."
+    response=$(curl -fsS -G \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data-urlencode "per_page=1" \
+        "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records") || {
+        echo "❌ Cloudflare DNS API 请求失败"
+        return 1
+    }
+
+    if printf '%s' "$response" | python3 -c '
+import json, sys
+try:
+    sys.exit(0 if json.load(sys.stdin).get("success") else 1)
+except ValueError:
+    sys.exit(1)
+'; then
+        echo "✅ Cloudflare DNS API 正常"
+        echo "Zone: $DOMAIN_SUFFIX"
+        return 0
+    fi
+
+    echo "❌ Cloudflare DNS API 测试失败"
+    return 1
+}
+
+cf_record_id() {
+    local record_type="$1"
+    local name="$2"
+    local response
+
+    response=$(curl -fsS -G \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data-urlencode "type=$record_type" \
+        --data-urlencode "name=$name" \
+        "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records") || return 1
+
+    printf '%s' "$response" | python3 -c '
+import json, sys
+try:
+    result = json.load(sys.stdin).get("result", [])
+    if result:
+        print(result[0]["id"])
+except (ValueError, KeyError, TypeError):
+    pass
+'
+}
+
+cf_payload() {
+    python3 - "$1" "$2" "$3" "$4" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "type": sys.argv[1],
+    "name": sys.argv[2],
+    "content": sys.argv[3],
+    "ttl": 1,
+    "proxied": sys.argv[4].lower() == "true",
+}))
+PY
+}
+
+cf_upsert_record() {
+    local record_type="$1"
+    local name="$2"
+    local content="$3"
+    local proxied="$4"
+    local record_id payload response method url
+
+    record_id=$(cf_record_id "$record_type" "$name")
+    payload=$(cf_payload "$record_type" "$name" "$content" "$proxied") || return 1
+
+    method="POST"
+    url="https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records"
+    if [ -n "$record_id" ]; then
+        method="PUT"
+        url="$url/$record_id"
+    fi
+
+    response=$(curl -fsS -X "$method" \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        --data "$payload" \
+        "$url") || {
+        echo "❌ Cloudflare $record_type 记录请求失败"
+        return 1
+    }
+
+    if printf '%s' "$response" | python3 -c '
+import json, sys
+try:
+    sys.exit(0 if json.load(sys.stdin).get("success") else 1)
+except ValueError:
+    sys.exit(1)
+'; then
+        if [ "$proxied" = "true" ]; then
+            echo "✅ $record_type $name → $content  小黄云"
+        else
+            echo "✅ $record_type $name → $content  灰云"
+        fi
+        return 0
+    fi
+
+    echo "❌ Cloudflare $record_type 记录操作失败"
+    return 1
+}
+
+cf_delete_type() {
+    local record_type="$1"
+    local name="$2"
+    local record_id response
+
+    record_id=$(cf_record_id "$record_type" "$name")
+    [ -z "$record_id" ] && return 0
+
+    response=$(curl -fsS -X DELETE \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$record_id") || {
+        echo "❌ 删除 Cloudflare $record_type 请求失败"
+        return 1
+    }
+
+    if printf '%s' "$response" | python3 -c '
+import json, sys
+try:
+    sys.exit(0 if json.load(sys.stdin).get("success") else 1)
+except ValueError:
+    sys.exit(1)
+'; then
+        echo "✅ 已删除 Cloudflare $record_type：$name"
+        return 0
+    fi
+
+    echo "❌ 删除 Cloudflare $record_type 失败"
+    return 1
+}
+
+setup_dns_for_service() {
+    local domain="$1"
+    local cf_mode proxied create_aaaa
+
+    load_config
+    if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then
+        echo
+        echo "⚠️ Cloudflare 尚未配置，跳过 DNS"
+        return 0
+    fi
+
+    echo
+    echo "Cloudflare DNS："
+    echo "1. 小黄云 / Proxied"
+    echo "2. 灰云 / DNS Only"
+    echo "3. 不处理 DNS"
+    echo
+    read -rp "请选择 [1]: " cf_mode
+    cf_mode="${cf_mode:-1}"
+
+    case "$cf_mode" in
+        1) proxied="true" ;;
+        2) proxied="false" ;;
+        3) return 0 ;;
+        *)
+            echo "❌ 无效选择"
+            return 1
+            ;;
+    esac
+
+    if [ -z "$ORIGIN_IPV4" ] && [ -z "$ORIGIN_IPV6" ]; then
+        echo "❌ 尚未配置源站 IP"
+        return 1
+    fi
+
+    echo
+    echo "正在配置 Cloudflare DNS..."
+    if [ -n "$ORIGIN_IPV4" ]; then
+        cf_upsert_record "A" "$domain" "$ORIGIN_IPV4" "$proxied" || return 1
+    fi
+
+    if [ -n "$ORIGIN_IPV6" ]; then
+        read -rp "同时创建 AAAA IPv6？ [Y/n]: " create_aaaa
+        create_aaaa="${create_aaaa:-Y}"
+        if [[ "$create_aaaa" =~ ^[Yy]$ ]]; then
+            cf_upsert_record "AAAA" "$domain" "$ORIGIN_IPV6" "$proxied" || return 1
+        fi
+    fi
+}
+
+add_service() {
+    local subdomain domain conf enabled protocol_choice protocol host port backend
+    local confirm ssl_extra old_conf
+
+    clear
+    load_config
+    echo "========== 添加 Web 服务 =========="
+    echo
+    read -rp "子域名（例如 uptime）: " subdomain
+
+    if ! [[ "$subdomain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
+        echo "❌ 子域名格式不正确"
+        return 1
+    fi
+
+    domain="${subdomain,,}.${DOMAIN_SUFFIX}"
+    conf="/etc/nginx/sites-available/${domain}.vmutex.conf"
+    enabled="/etc/nginx/sites-enabled/${domain}.vmutex.conf"
+    if [ -e "$conf" ]; then
+        echo "❌ $domain 已经由 VMUTEX 管理"
+        return 1
+    fi
+
+    echo
+    echo "后端协议："
+    echo "1. http"
+    echo "2. https"
+    read -rp "请选择 [1]: " protocol_choice
+    if [ "$protocol_choice" = "2" ]; then
+        protocol="https"
+    else
+        protocol="http"
+    fi
+
+    read -rp "后端地址 [127.0.0.1]: " host
+    host="${host:-127.0.0.1}"
+    if ! [[ "$host" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+        echo "❌ 后端地址格式不正确"
+        return 1
+    fi
+
+    read -rp "后端端口: " port
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo "❌ 端口不正确"
+        return 1
+    fi
+
+    backend="${protocol}://${host}:${port}"
+    echo
+    echo "域名：$domain"
+    echo "后端：$backend"
+    echo
+    read -rp "确认添加？ [y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+
+    setup_dns_for_service "$domain" || {
+        echo "❌ DNS 配置失败，停止添加服务"
+        return 1
+    }
+
+    mkdir -p "$CERTBOT_ROOT/.well-known/acme-challenge"
+    cat > "$conf" <<NGINX
+# VMUTEX-MANAGED
+# DOMAIN=$domain
+# BACKEND=$backend
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+
+    location /.well-known/acme-challenge/ {
+        root $CERTBOT_ROOT;
+    }
+
+    location / {
+        return 200 "vmutex certificate setup\n";
+    }
+}
+NGINX
+
+    ln -sf "$conf" "$enabled"
+    if ! nginx -t; then
+        echo "❌ Nginx 配置检查失败"
+        rm -f "$enabled" "$conf"
+        return 1
+    fi
+    systemctl reload nginx
+
+    echo
+    echo "正在申请 Let's Encrypt 证书..."
+    if ! certbot certonly --webroot -w "$CERTBOT_ROOT" -d "$domain"; then
+        echo "❌ 证书申请失败；临时配置已保留以便排查"
+        return 1
+    fi
+
+    ssl_extra=""
+    if [ "$protocol" = "https" ]; then
+        ssl_extra="        proxy_ssl_verify off;"
+    fi
+
+    old_conf=$(mktemp)
+    cp "$conf" "$old_conf"
+    cat > "$conf" <<NGINX
+# VMUTEX-MANAGED
+# DOMAIN=$domain
+# BACKEND=$backend
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+
+    location /.well-known/acme-challenge/ {
+        root $CERTBOT_ROOT;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    listen 127.0.0.1:9443 ssl;
+    server_name $domain;
+
+    ssl_certificate     /etc/letsencrypt/live/$domain/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/$domain/privkey.pem;
+
+    location / {
+        proxy_pass $backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+$ssl_extra
+    }
+}
+NGINX
+
+    if nginx -t; then
+        rm -f "$old_conf"
+        systemctl reload nginx
+        echo
+        echo "✅ 添加完成"
+        echo "https://$domain → $backend"
+    else
+        cp "$old_conf" "$conf"
+        rm -f "$old_conf"
+        echo "❌ 最终 Nginx 配置检查失败，已恢复临时配置"
+        return 1
+    fi
+}
+
+list_services() {
+    local conf domain backend found=0
+
+    echo
+    echo "========== VMUTEX Web 服务 =========="
+    echo
+    for conf in /etc/nginx/sites-available/*.vmutex.conf; do
+        [ -e "$conf" ] || continue
+        found=1
+        domain=$(grep '^# DOMAIN=' "$conf" | head -1 | cut -d= -f2-)
+        backend=$(grep '^# BACKEND=' "$conf" | head -1 | cut -d= -f2-)
+        echo "• $domain"
+        echo "  → $backend"
+        echo
+    done
+    [ "$found" -eq 0 ] && echo "暂无服务"
+}
+
+import_service() {
+    local subdomain domain destination enabled escaped_domain source backend
+    local confirm old_enabled old_was_enabled=0
+
+    clear
+    load_config
+    echo "========== 导入现有服务 =========="
+    echo
+    read -rp "子域名（例如 komari）: " subdomain
+    if ! [[ "$subdomain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
+        echo "❌ 子域名格式不正确"
+        return 1
+    fi
+
+    domain="${subdomain,,}.${DOMAIN_SUFFIX}"
+    destination="/etc/nginx/sites-available/${domain}.vmutex.conf"
+    enabled="/etc/nginx/sites-enabled/${domain}.vmutex.conf"
+    if [ -e "$destination" ]; then
+        echo "❌ $domain 已由 VMUTEX 管理"
+        return 1
+    fi
+
+    escaped_domain="${domain//./\\.}"
+    source=$(grep -lE \
+        "server_name[[:space:]]+${escaped_domain}([[:space:];]|$)" \
+        /etc/nginx/sites-available/* 2>/dev/null \
+        | grep -v '\.vmutex\.conf$' \
+        | head -1)
+
+    if [ -z "$source" ]; then
+        echo "没有自动找到配置。"
+        read -rp "请输入配置文件路径: " source
+    fi
+    if [ ! -f "$source" ]; then
+        echo "❌ 找不到配置文件"
+        return 1
+    fi
+
+    backend=$(awk '
+        /^[[:space:]]*proxy_pass[[:space:]]+/ {
+            gsub(/;/, "", $2)
+            print $2
+            exit
+        }
+    ' "$source")
+    backend="${backend:-未检测到}"
+
+    echo
+    echo "配置：$source"
+    echo "域名：$domain"
+    echo "后端：$backend"
+    echo "导入不会重新申请证书。"
+    read -rp "确认导入？ [y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+
+    old_enabled="/etc/nginx/sites-enabled/$(basename "$source")"
+    if [ -e "$old_enabled" ] || [ -L "$old_enabled" ]; then
+        old_was_enabled=1
+        rm -f "$old_enabled"
+    fi
+
+    {
+        echo "# VMUTEX-MANAGED"
+        echo "# DOMAIN=$domain"
+        echo "# BACKEND=$backend"
+        echo
+        cat "$source"
+    } > "$destination"
+    ln -sf "$destination" "$enabled"
+
+    if nginx -t; then
+        systemctl reload nginx
+        rm -f "$source"
+        echo "✅ 导入成功：$domain → $backend"
+    else
+        echo "❌ 导入失败，正在回滚"
+        rm -f "$enabled" "$destination"
+        if [ "$old_was_enabled" -eq 1 ]; then
+            ln -sf "$source" "$old_enabled"
+        fi
+        return 1
+    fi
+}
+
+delete_service() {
+    local -a files
+    local index=1 conf domain enabled number confirm delete_dns
+
+    clear
+    load_config
+    echo "========== 删除 Web 服务 =========="
+    echo
+
+    shopt -s nullglob
+    files=(/etc/nginx/sites-available/*.vmutex.conf)
+    shopt -u nullglob
+    if [ "${#files[@]}" -eq 0 ]; then
+        echo "暂无 VMUTEX 服务"
+        return 0
+    fi
+
+    for conf in "${files[@]}"; do
+        domain=$(grep '^# DOMAIN=' "$conf" | head -1 | cut -d= -f2-)
+        echo "$index. $domain"
+        ((index++))
+    done
+
+    echo
+    read -rp "请选择要删除的服务 [0取消]: " number
+    [ "$number" = "0" ] && return 0
+    if ! [[ "$number" =~ ^[0-9]+$ ]] || [ "$number" -lt 1 ] || [ "$number" -gt "${#files[@]}" ]; then
+        echo "❌ 无效选择"
+        return 1
+    fi
+
+    conf="${files[$((number - 1))]}"
+    domain=$(grep '^# DOMAIN=' "$conf" | head -1 | cut -d= -f2-)
+    enabled="/etc/nginx/sites-enabled/$(basename "$conf")"
+    echo "准备删除：$domain"
+    echo "不会删除 Let's Encrypt 证书。"
+    read -rp "确认？ [y/N]: " confirm
+    [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+
+    rm -f "$enabled"
+    if nginx -t; then
+        rm -f "$conf"
+        systemctl reload nginx
+        echo "✅ Nginx 服务已删除"
+        if [ -n "$CF_API_TOKEN" ] && [ -n "$CF_ZONE_ID" ]; then
+            read -rp "同时删除 Cloudflare A/AAAA DNS？ [y/N]: " delete_dns
+            if [[ "$delete_dns" =~ ^[Yy]$ ]]; then
+                cf_delete_type "A" "$domain"
+                cf_delete_type "AAAA" "$domain"
+            fi
+        fi
+    else
+        ln -sf "$conf" "$enabled"
+        echo "❌ Nginx 检查失败，已回滚"
+        return 1
+    fi
+}
+
+show_cf_status() {
+    load_config
+    echo
+    echo "========== Cloudflare =========="
+    echo
+    echo "域名：${DOMAIN_SUFFIX:-未配置}"
+    if [ -n "$CF_API_TOKEN" ]; then
+        echo "Token：已配置"
+    else
+        echo "Token：未配置"
+    fi
+    echo "Zone ID：${CF_ZONE_ID:-未配置}"
+    echo "IPv4：${ORIGIN_IPV4:-未配置}"
+    echo "IPv6：${ORIGIN_IPV6:-未配置}"
+}
+
+repository_name() {
+    local repository="${VMUTEX_REPOSITORY:-}"
+
+    if [ -z "$repository" ] && [ -r "$REPOSITORY_FILE" ]; then
+        IFS= read -r repository < "$REPOSITORY_FILE"
+    fi
+    if [ -z "$repository" ] || [ "$repository" = "__VMUTEX_REPOSITORY__" ]; then
+        repository="$VMUTEX_REPOSITORY_DEFAULT"
+    fi
+    if [ "$repository" = "__VMUTEX_REPOSITORY__" ] || ! [[ "$repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+        return 1
+    fi
+    printf '%s\n' "$repository"
+}
+
+valid_release_tag() {
+    [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+}
+
+version_is_newer() {
+    python3 - "$1" "$2" <<'PY'
+import sys
+
+try:
+    current = tuple(int(part) for part in sys.argv[1].split("."))
+    latest = tuple(int(part) for part in sys.argv[2].split("."))
+except ValueError:
+    sys.exit(2)
+sys.exit(0 if latest > current else 1)
+PY
+}
+
+script_version() {
+    sed -n 's/^readonly VMUTEX_VERSION="\([0-9][0-9.]*\)"$/\1/p' "$1" | head -1
+}
+
+update_vmutex() {
+    local assume_yes="${1:-false}"
+    local repository api_url download_root temp_dir metadata tag latest_version
+    local candidate checksum_file candidate_version install_temp backup stamp confirm
+
+    repository=$(repository_name) || {
+        echo "❌ 更新仓库尚未配置。请使用 Release 中的 install.sh 重新安装。"
+        return 1
+    }
+    api_url="${VMUTEX_RELEASE_API_URL:-https://api.github.com/repos/${repository}/releases/latest}"
+    download_root="${VMUTEX_RELEASE_DOWNLOAD_BASE:-https://github.com/${repository}/releases/download}"
+    temp_dir=$(mktemp -d) || return 1
+    metadata="$temp_dir/release.json"
+
+    echo "正在检查更新（当前版本 v$VMUTEX_VERSION）..."
+    if ! curl -fsSL --connect-timeout 10 --max-time 30 "$api_url" -o "$metadata"; then
+        echo "❌ 无法读取 GitHub Release 信息"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    tag=$(python3 - "$metadata" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        print(json.load(handle).get("tag_name", ""))
+except (OSError, ValueError, TypeError):
+    pass
+PY
+)
+    if ! valid_release_tag "$tag"; then
+        echo "❌ Release 版本标签无效：${tag:-空}"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    latest_version="${tag#v}"
+
+    if ! version_is_newer "$VMUTEX_VERSION" "$latest_version"; then
+        echo "✅ 已是最新版本 v$VMUTEX_VERSION"
+        rm -rf "$temp_dir"
+        return 0
+    fi
+
+    echo "发现新版本：v$VMUTEX_VERSION → $tag"
+    if [ "$assume_yes" != "true" ]; then
+        read -rp "确认更新？ [y/N]: " confirm
+        if ! [[ "$confirm" =~ ^[Yy]$ ]]; then
+            echo "已取消更新"
+            rm -rf "$temp_dir"
+            return 0
+        fi
+    fi
+
+    candidate="$temp_dir/vmutex"
+    checksum_file="$temp_dir/vmutex.sha256"
+    if ! curl -fsSL --connect-timeout 10 --max-time 60 "$download_root/$tag/vmutex" -o "$candidate" ||
+       ! curl -fsSL --connect-timeout 10 --max-time 30 "$download_root/$tag/vmutex.sha256" -o "$checksum_file"; then
+        echo "❌ 更新文件下载失败；当前版本未改变"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    if ! (cd "$temp_dir" && sha256sum -c vmutex.sha256 >/dev/null); then
+        echo "❌ SHA-256 校验失败；当前版本未改变"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    if ! bash -n "$candidate"; then
+        echo "❌ 新脚本语法检查失败；当前版本未改变"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+    candidate_version=$(script_version "$candidate")
+    if [ "$candidate_version" != "$latest_version" ]; then
+        echo "❌ 脚本版本与 Release 标签不一致；当前版本未改变"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    mkdir -p "$BACKUP_DIR"
+    chmod 700 "$BACKUP_DIR"
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    backup="$BACKUP_DIR/vmutex-v${VMUTEX_VERSION}-${stamp}"
+    if [ -e "$INSTALL_PATH" ]; then
+        cp -p "$INSTALL_PATH" "$backup" || {
+            echo "❌ 无法创建备份；当前版本未改变"
+            rm -rf "$temp_dir"
+            return 1
+        }
+    fi
+
+    install_temp="${INSTALL_PATH}.new.$$"
+    if ! install -o root -g root -m 0755 "$candidate" "$install_temp" 2>/dev/null; then
+        if [ "${VMUTEX_TEST_MODE:-0}" = "1" ]; then
+            install -m 0755 "$candidate" "$install_temp" || {
+                rm -rf "$temp_dir"
+                return 1
+            }
+        else
+            echo "❌ 无法准备新脚本；当前版本未改变"
+            rm -rf "$temp_dir"
+            return 1
+        fi
+    fi
+
+    if ! mv -f "$install_temp" "$INSTALL_PATH"; then
+        rm -f "$install_temp"
+        echo "❌ 无法替换脚本；当前版本未改变"
+        rm -rf "$temp_dir"
+        return 1
+    fi
+
+    rm -rf "$temp_dir"
+    echo "✅ VMUTEX 已更新到 $tag"
+    [ -e "$backup" ] && echo "备份：$backup"
+}
+
+show_menu() {
+    local choice
+
+    ensure_domain_config
+    while true; do
+        clear
+        echo "============================"
+        echo "       VMUTEX v$VMUTEX_VERSION"
+        echo "============================"
+        echo "1. 添加 Web 服务"
+        echo "2. 查看 Web 服务"
+        echo "3. 导入现有 Web 服务"
+        echo "4. 删除 Web 服务"
+        echo "5. Cloudflare 设置"
+        echo "6. Cloudflare 状态 / 测试"
+        echo "7. 检查 Nginx"
+        echo "8. 检查并更新"
+        echo "0. 退出"
+        echo "============================"
+        read -rp "请选择: " choice
+
+        case "$choice" in
+            1) add_service; pause ;;
+            2) list_services; pause ;;
+            3) import_service; pause ;;
+            4) delete_service; pause ;;
+            5) cf_setup; pause ;;
+            6) show_cf_status; echo; cf_test; pause ;;
+            7) nginx -t; pause ;;
+            8) update_vmutex false; pause ;;
+            0) exit 0 ;;
+            *) echo "无效选项"; sleep 1 ;;
+        esac
+    done
+}
+
+usage() {
+    cat <<'EOF'
+用法：
+  vmutex             打开交互面板
+  vmutex version     显示当前版本
+  vmutex update      检查更新并确认安装
+  vmutex update --yes
+EOF
+}
+
+main() {
+    require_root
+    prepare_config_dir
+
+    case "${1:-}" in
+        "") show_menu ;;
+        version|--version|-v) echo "vmutex v$VMUTEX_VERSION" ;;
+        update)
+            if [ "${2:-}" = "--yes" ] || [ "${2:-}" = "-y" ]; then
+                update_vmutex true
+            else
+                update_vmutex false
+            fi
+            ;;
+        help|--help|-h) usage ;;
+        *) usage; return 2 ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
