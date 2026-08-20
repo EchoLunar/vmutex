@@ -1,0 +1,21 @@
+name: ShellCheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Bash syntax
+        run: bash -n vmutex install.sh tests/test.sh
+      - name: Tests
+        run: bash tests/test.sh
+      - name: ShellCheck
+        run: shellcheck vmutex install.sh tests/test.sh
